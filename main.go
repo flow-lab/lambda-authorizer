@@ -2,86 +2,144 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-lambda-go/lambdacontext"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/flow-lab/dlog"
 	"github.com/sirupsen/logrus"
+	"io/ioutil"
+	"math/big"
+	"net/http"
+	"os"
 	"strings"
 )
 
 // Handler for lambda execution
 func Handler(ctx context.Context, event events.APIGatewayCustomAuthorizerRequest) (events.APIGatewayCustomAuthorizerResponse, error) {
 	lambdaContext, _ := lambdacontext.FromContext(ctx)
-	requstLogger := dlog.NewRequestLogger(lambdaContext.AwsRequestID, "log-group-retention")
-
-	requstLogger.Infof("Client token: %v", event.AuthorizationToken)
-	requstLogger.Infof("Method ARN: %v", event.MethodArn)
-
-	return Process(event, requstLogger)
+	requestLogger := dlog.NewRequestLogger(lambdaContext.AwsRequestID, "log-group-retention")
+	requestLogger.Infof("client token: %v", event.AuthorizationToken)
+	requestLogger.Infof("method ARN: %v", event.MethodArn)
+	return Process(event, requestLogger)
 }
 
 func Process(event events.APIGatewayCustomAuthorizerRequest, requstLogger *logrus.Entry) (events.APIGatewayCustomAuthorizerResponse, error) {
-
-	// validate the incoming token
-	// and produce the principal user identifier associated with the token
-
-	// this could be accomplished in a number of ways:
-	// 1. Call out to OAuth provider
-	// 2. Decode a JWT token inline
-	// 3. Lookup in a self-managed DB
-	principalID := "user|a1b2c3d4"
-
-	if !isAuthorized(event) {
+	token, err := decodeToken(event.AuthorizationToken, requstLogger)
+	if err != nil || !token.Valid {
 		return events.APIGatewayCustomAuthorizerResponse{}, errors.New("unauthorized")
 	}
 
-	// if the token is valid, a policy must be generated which will allow or deny access to the client
-
-	// if access is denied, the client will recieve a 403 Access Denied response
-	// if access is allowed, API Gateway will proceed with the backend integration configured on the method that was called
-
-	// this function must generate a policy that is associated with the recognized principal user identifier.
-	// depending on your use case, you might store policies in a DB, or generate them on the fly
-
-	// keep in mind, the policy is cached for 5 minutes by default (TTL is configurable in the authorizer)
-	// and will apply to subsequent calls to any method/resource in the RestApi
-	// made with the same token
-
-	//the example policy below denies access to all resources in the RestApi
 	tmp := strings.Split(event.MethodArn, ":")
 	apiGatewayArnTmp := strings.Split(tmp[5], "/")
 	awsAccountID := tmp[4]
 
-	resp := NewAuthorizerResponse(principalID, awsAccountID)
+	principalId := token.Claims.(*CognitoClaims).Sub
+	resp := NewAuthorizerResponse(principalId, awsAccountID)
 	resp.Region = tmp[3]
 	resp.APIID = apiGatewayArnTmp[0]
 	resp.Stage = apiGatewayArnTmp[1]
 	resp.DenyAllMethods()
-	// resp.AllowMethod(Get, "/user/*")
 
-	// new! -- add additional key-value pairs associated with the authenticated principal
-	// these are made available by APIGW like so: $context.authorizer.<key>
-	// additional context is cached
-	resp.Context = map[string]interface{}{
-		"stringKey":  "stringval",
-		"numberKey":  123,
-		"booleanKey": true,
-	}
-
-	requstLogger.Debugf("Response: %v", resp)
-
+	requstLogger.Debugf("response: %v", resp)
 	return resp.APIGatewayCustomAuthorizerResponse, nil
 }
 
-func isAuthorized(event events.APIGatewayCustomAuthorizerRequest) bool {
-	// TODO [grokrz[: impl
-	return false
+// https://cognito-idp.<region>.amazonaws.com/<cognito-id>/.well-known/jwks.json
+type Jwks struct {
+	Keys []Key `json:"keys"`
 }
 
-func main() {
-	lambda.Start(Handler)
+type Key struct {
+	Alg string `json:"alg"`
+	Kid string `json:"kid"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+type CognitoClaims struct {
+	Sub string `json:"sub"`
+	jwt.StandardClaims
+}
+
+func decodeToken(tokenString string, log *logrus.Entry) (*jwt.Token, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &CognitoClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			err := fmt.Errorf("unknown signing method: %v", token.Header["alg"])
+			log.Error(err.Error())
+			return nil, err
+		}
+		k := getKey(token.Header["kid"].(string), log)
+		rsaPublicKey, err := mapToRSAPublicKey(k.E, k.N)
+		return rsaPublicKey, err
+	})
+
+	return token, err
+}
+
+// https://gist.github.com/MathieuMailhos/361f24316d2de29e8d41e808e0071b13
+func mapToRSAPublicKey(encodedE, encodedN string) (*rsa.PublicKey, error) {
+	decodedE, err := base64.RawURLEncoding.DecodeString(encodedE)
+	if err != nil {
+		return nil, err
+	}
+	if len(decodedE) < 4 {
+		ndata := make([]byte, 4)
+		copy(ndata[4-len(decodedE):], decodedE)
+		decodedE = ndata
+	}
+	pubKey := &rsa.PublicKey{
+		N: &big.Int{},
+		E: int(binary.BigEndian.Uint32(decodedE[:])),
+	}
+	decodedN, err := base64.RawURLEncoding.DecodeString(encodedN)
+	if err != nil {
+		panic(err)
+	}
+	pubKey.N.SetBytes(decodedN)
+	return pubKey, nil
+}
+
+func getKey(kid string, log *logrus.Entry) Key {
+	log.Debugf("about to find Key for: %s", kid)
+	var inputJSON = getKeyJwks(log)
+	var jwkss Jwks
+	json.Unmarshal(inputJSON, &jwkss)
+
+	for _, j := range jwkss.Keys {
+		if j.Kid == kid {
+			log.Debugf("found %s", kid)
+			return j
+		}
+	}
+
+	return Key{}
+}
+
+func getKeyJwks(log *logrus.Entry) []byte {
+	// TODO [grokrz]: fail fast if not found
+	cognitoId := os.Getenv("COGNITO_ID")
+	awsRegion := os.Getenv("AWS_REGION")
+	url := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/%s/.well-known/jwks.json", awsRegion, cognitoId)
+	log.Debugf("about to fetch: %s", url)
+	response, e := http.Get(url)
+	if e != nil || response.StatusCode != 200 {
+		// TODO [grokrz[: fail
+		log.Fatal(e)
+	}
+	jwksStr, err := ioutil.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return jwksStr
 }
 
 type HttpVerb int
@@ -199,4 +257,8 @@ func (r *AuthorizerResponse) AllowMethod(verb HttpVerb, resource string) {
 
 func (r *AuthorizerResponse) DenyMethod(verb HttpVerb, resource string) {
 	r.addMethod(Deny, verb, resource)
+}
+
+func main() {
+	lambda.Start(Handler)
 }

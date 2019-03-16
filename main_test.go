@@ -11,8 +11,24 @@ import (
 
 const requestID = "1-581cf771-a006649127e371903a2de979"
 
-func TestUnauthenticated(t *testing.T) {
-	var inputJSON = readFile("token-unauthenticated.json")
+// Toke will expire ...
+// TODO [grokrz]: mock ?
+//func TestValid(t *testing.T) {
+//	os.Setenv("COGNITO_ID", "eu-west-1_yubvj7uwx")
+//	os.Setenv("AWS_REGION", "eu-west-1")
+//	var inputJSON = readFile("token-valid.json")
+//	var event events.APIGatewayCustomAuthorizerRequest
+//	if err := json.Unmarshal(inputJSON, &event); err != nil {
+//		assert.FailNow(t, "unable to deserialize", inputJSON)
+//	}
+//	output, err := Process(event, dlog.NewRequestLogger(requestID, "test"))
+//
+//	assert.Nil(t, err)
+//	assert.NotNil(t, output.PrincipalID)
+//}
+
+func TestExpired(t *testing.T) {
+	var inputJSON = readFile("token-expired.json")
 	var event events.APIGatewayCustomAuthorizerRequest
 	if err := json.Unmarshal(inputJSON, &event); err != nil {
 		assert.FailNow(t, "unable to deserialize", inputJSON)
@@ -20,7 +36,19 @@ func TestUnauthenticated(t *testing.T) {
 
 	_, err := Process(event, dlog.NewRequestLogger(requestID, "test"))
 
-	assert.NotNil(t, err)
+	assert.Equal(t, "unauthorized", err.Error())
+}
+
+func TestInvalid(t *testing.T) {
+	var inputJSON = readFile("token-invalid.json")
+	var event events.APIGatewayCustomAuthorizerRequest
+	if err := json.Unmarshal(inputJSON, &event); err != nil {
+		assert.FailNow(t, "unable to deserialize", inputJSON)
+	}
+
+	_, err := Process(event, dlog.NewRequestLogger(requestID, "test"))
+
+	assert.Equal(t, "unauthorized", err.Error())
 }
 
 func readFile(path string) []byte {

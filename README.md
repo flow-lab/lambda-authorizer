@@ -1,2 +1,2 @@
-# custom-authorizer
-AWS API Gateway Cognito custom authorizer
+# lambda-authorizer
+Amazon API Gateway Lambda Authorizer
