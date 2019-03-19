@@ -14,7 +14,7 @@ const requestID = "1-581cf771-a006649127e371903a2de979"
 // Toke will expire ...
 // TODO [grokrz]: mock ?
 //func TestValid(t *testing.T) {
-//	os.Setenv("COGNITO_ID", "eu-west-1_yubvj7uwx")
+//	os.Setenv("COGNITO_IDS", "eu-west-1_yubvj7uwx,eu-west-1_yubvj7uwx")
 //	os.Setenv("AWS_REGION", "eu-west-1")
 //	var inputJSON = readFile("token-valid.json")
 //	var event events.APIGatewayCustomAuthorizerRequest

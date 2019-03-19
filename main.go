@@ -24,15 +24,15 @@ import (
 // Handler for lambda execution
 func Handler(ctx context.Context, event events.APIGatewayCustomAuthorizerRequest) (events.APIGatewayCustomAuthorizerResponse, error) {
 	lambdaContext, _ := lambdacontext.FromContext(ctx)
-	requestLogger := dlog.NewRequestLogger(lambdaContext.AwsRequestID, "log-group-retention")
-	requestLogger.Infof("client token: %v", event.AuthorizationToken)
+	requestLogger := dlog.NewRequestLogger(lambdaContext.AwsRequestID, "lambda-authorizer")
 	requestLogger.Infof("method ARN: %v", event.MethodArn)
 	return Process(event, requestLogger)
 }
 
-func Process(event events.APIGatewayCustomAuthorizerRequest, requstLogger *logrus.Entry) (events.APIGatewayCustomAuthorizerResponse, error) {
-	token, err := decodeToken(event.AuthorizationToken, requstLogger)
-	if err != nil || !token.Valid {
+func Process(event events.APIGatewayCustomAuthorizerRequest, log *logrus.Entry) (events.APIGatewayCustomAuthorizerResponse, error) {
+	token, err := decodeToken(event.AuthorizationToken, log)
+	if !validate(token, err, log) {
+		log.Debug("unauthorized. Token is not valid")
 		return events.APIGatewayCustomAuthorizerResponse{}, errors.New("unauthorized")
 	}
 
@@ -47,8 +47,27 @@ func Process(event events.APIGatewayCustomAuthorizerRequest, requstLogger *logru
 	resp.Stage = apiGatewayArnTmp[1]
 	resp.DenyAllMethods()
 
-	requstLogger.Debugf("response: %v", resp)
+	log.Debugf("response: %v", resp)
 	return resp.APIGatewayCustomAuthorizerResponse, nil
+}
+
+func validate(token *jwt.Token, err error, log *logrus.Entry) bool {
+	if err != nil {
+		log.Debugf("token use is not valid, err: %v", err)
+		return false
+	}
+
+	if !token.Valid {
+		log.Debugf("token use is not valid")
+		return false
+	}
+
+	if token.Claims.(*CognitoClaims).TokenUse != "id" {
+		log.Debugf("token use is not 'id', only id Token kan be authorized")
+		return false
+	}
+
+	return true
 }
 
 // https://cognito-idp.<region>.amazonaws.com/<cognito-id>/.well-known/jwks.json
@@ -64,7 +83,8 @@ type Key struct {
 }
 
 type CognitoClaims struct {
-	Sub string `json:"sub"`
+	Sub      string `json:"sub"`
+	TokenUse string `json:"token_use"`
 	jwt.StandardClaims
 }
 
@@ -75,7 +95,10 @@ func decodeToken(tokenString string, log *logrus.Entry) (*jwt.Token, error) {
 			log.Error(err.Error())
 			return nil, err
 		}
-		k := getKey(token.Header["kid"].(string), log)
+		k, err := getKey(token.Header["kid"].(string), log)
+		if err != nil {
+			return nil, err
+		}
 		rsaPublicKey, err := mapToRSAPublicKey(k.E, k.N)
 		return rsaPublicKey, err
 	})
@@ -106,40 +129,72 @@ func mapToRSAPublicKey(encodedE, encodedN string) (*rsa.PublicKey, error) {
 	return pubKey, nil
 }
 
-func getKey(kid string, log *logrus.Entry) Key {
+func getKey(kid string, log *logrus.Entry) (Key, error) {
 	log.Debugf("about to find Key for: %s", kid)
-	var inputJSON = getKeyJwks(log)
-	var jwkss Jwks
-	json.Unmarshal(inputJSON, &jwkss)
-
-	for _, j := range jwkss.Keys {
-		if j.Kid == kid {
-			log.Debugf("found %s", kid)
-			return j
+	var err error
+	if j, err := getKeyJwks(log); err == nil {
+		for _, jwks := range j {
+			for _, j := range jwks.Keys {
+				if j.Kid == kid {
+					log.Debugf("found %s", kid)
+					return j, nil
+				}
+			}
 		}
 	}
 
-	return Key{}
+	return Key{}, fmt.Errorf("key not found. error: %v", err)
 }
 
-func getKeyJwks(log *logrus.Entry) []byte {
-	// TODO [grokrz]: fail fast if not found
-	cognitoId := os.Getenv("COGNITO_ID")
-	awsRegion := os.Getenv("AWS_REGION")
-	url := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/%s/.well-known/jwks.json", awsRegion, cognitoId)
-	log.Debugf("about to fetch: %s", url)
-	response, e := http.Get(url)
-	if e != nil || response.StatusCode != 200 {
-		// TODO [grokrz[: fail
-		log.Fatal(e)
+func getKeyJwks(log *logrus.Entry) ([]*Jwks, error) {
+	cognitoIds := parseIds(os.Getenv("COGNITO_IDS"))
+	if len(cognitoIds) < 1 {
+		return nil, fmt.Errorf("COGNITO_IDS cannot be empty")
 	}
-	jwksStr, err := ioutil.ReadAll(response.Body)
-	response.Body.Close()
-	if err != nil {
-		log.Fatal(err)
+	awsRegion := os.Getenv("AWS_REGION")
+	if awsRegion == "" {
+		return nil, fmt.Errorf("AWS_REGION cannot be empty")
 	}
 
-	return jwksStr
+	var jwkss []*Jwks
+	for _, cognitoId := range cognitoIds {
+		url := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/%s/.well-known/jwks.json", awsRegion, cognitoId)
+		log.Debugf("about to get: %s", url)
+		response, err := http.Get(url)
+		if err != nil || response.StatusCode != 200 {
+			log.Errorf("unable to get jwks, err: %v", err)
+			return nil, err
+		}
+		jwksByteArr, err := ioutil.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			log.Errorf("unable to read the body, err: %v", err)
+			return nil, err
+		}
+
+		var jwks Jwks
+		json.Unmarshal(jwksByteArr, &jwks)
+		jwkss = append(jwkss, &jwks)
+	}
+
+	return jwkss, nil
+}
+
+func parseIds(s string) []string {
+	arr := strings.Split(s, ",")
+	return filter(arr, func(v string) bool {
+		return v != ""
+	})
+}
+
+func filter(vs []string, f func(string) bool) []string {
+	vsf := make([]string, 0)
+	for _, v := range vs {
+		if f(v) {
+			vsf = append(vsf, v)
+		}
+	}
+	return vsf
 }
 
 type HttpVerb int
